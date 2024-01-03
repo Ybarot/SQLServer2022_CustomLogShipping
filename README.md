@@ -1,0 +1,2 @@
+# SQLServer2022_CustomLogShipping
+SQLServer2022_CustomLogShipping
