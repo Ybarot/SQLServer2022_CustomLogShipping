@@ -1,0 +1,35 @@
+-- For Backups
+
+DECLARE @linkedservername NVARCHAR(128)
+DECLARE @backupurlpath NVARCHAR(256)
+DECLARE @dbname NVARCHAR(100)
+
+SET @linkedservername = 'ONPREM' -- Replace 'ONPREM' with the name of the linked server configured on the source server
+SET @backupurlpath = 'S3://kc-sql2022-s3.s3.amazonaws.com/sql2022-azurevm-backups/'
+SET @dbname = 'ALLUSERDBs' -- Replace 'DatabaseName' with the actual database name you want to backup or use ALLUSERDBs 
+
+DECLARE @execCommand NVARCHAR(MAX)
+
+SET @execCommand = N'
+    EXEC ' + QUOTENAME(@linkedservername) + '.msdb.dbo.sp_PerformBackups N''' + @backupurlpath + ''', N''' + @dbname + ''''
+
+EXEC (@execCommand)
+
+
+-- For Restore
+
+EXEC msdb.dbo.sp_PerformRestores
+   @backupurlpath = 'S3://kc-sql2022-s3.s3.amazonaws.com/sql2022-azurevm-backups/',
+ 	  @dbname = 'ALLUSERDBs';
+
+
+-- Verify the status of database in restoring stage 
+
+SELECT
+    database_name AS 'Database Name',
+    state_desc AS 'State',
+    percent_complete AS 'Percent Complete',
+    start_time AS 'Start Time',
+    finish_time AS 'Finish Time'
+FROM sys.dm_exec_requests
+WHERE command = 'RESTORE DATABASE';

@@ -1,0 +1,166 @@
+USE [msdb]
+GO
+
+
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+
+IF NOT EXISTS (SELECT name FROM msdb.dbo.syscategories WHERE name=N'[Uncategorized (Local)]' AND category_class=1)
+BEGIN
+EXEC @ReturnCode = msdb.dbo.sp_add_category @class=N'JOB', @type=N'LOCAL', @name=N'[Uncategorized (Local)]'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+END
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode =  msdb.dbo.sp_add_job @job_name=N'Custom LogShipping', 
+		@enabled=1, 
+		@notify_level_eventlog=0, 
+		@notify_level_email=0, 
+		@notify_level_netsend=0, 
+		@notify_level_page=0, 
+		@delete_level=0, 
+		@description=N'Job to restore the pending logs', 
+		@category_name=N'[Uncategorized (Local)]', 
+		@owner_login_name=N'EC2AMAZ-BHJ6PQV\Administrator', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Tlog Restores', 
+		@step_id=1, 
+		@cmdexec_success_code=0, 
+		@on_success_action=1, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'--- Query to restore the Tlogs that are available 
+
+IF OBJECT_ID(''tempdb..#BackupFiles'') IS NOT NULL
+    DROP TABLE #BackupFiles
+GO
+
+CREATE TABLE #BackupFiles (
+    database_name VARCHAR(100),
+    physical_device_name VARCHAR(MAX),
+    backup_start_date DATETIME,
+    first_lsn BIGINT,
+    last_lsn BIGINT
+)
+
+-- Get the maximum last LSN for each database
+;WITH MaxLastLSN AS (
+    SELECT
+        database_name,
+        MAX(last_lsn) AS max_last_lsn
+    FROM [msdb].[dbo].backupset
+    WHERE type = ''L'' AND is_copy_only = 0
+    GROUP BY database_name
+)
+
+-- Insert the backup files into the temporary table
+INSERT INTO #BackupFiles
+SELECT
+    Source.[Database],
+    Source.physical_device_name AS [Source],
+    Source.backup_start_date AS [Backup Date],
+    Source.first_lsn,
+    Source.last_lsn
+FROM (
+    SELECT
+        BS.database_name AS [Database],
+        physical_device_name,
+        BS.first_lsn,
+        BS.last_lsn,
+        BS.backup_start_date
+    FROM
+        [ONPREM].msdb.[dbo].backupset AS BS
+        INNER JOIN [ONPREM].msdb.[dbo].backupmediaset AS BMS ON BS.media_set_id = BMS.media_set_id
+        INNER JOIN [ONPREM].msdb.[dbo].backupmediafamily AS BMF ON BMS.media_set_id = BMF.media_set_id
+        INNER JOIN MaxLastLSN AS MaxLSN ON BS.database_name = MaxLSN.database_name
+    WHERE
+        BS.type = ''L'' AND
+        BS.last_lsn > MaxLSN.max_last_lsn AND
+        BS.expiration_date IS NULL
+) AS Source
+LEFT JOIN (
+    SELECT
+        bmf.physical_device_name,
+        MAX(rh.restore_date) AS restore_date
+    FROM
+        msdb.dbo.restorehistory rh
+        INNER JOIN msdb.dbo.backupset bs ON rh.backup_set_id = bs.backup_set_id
+        INNER JOIN msdb.dbo.restorefile rf ON rh.restore_history_id = rf.restore_history_id
+        INNER JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id
+    WHERE
+        rh.destination_database_name IN (SELECT database_name FROM MaxLastLSN)
+    GROUP BY bmf.physical_device_name
+) AS Target ON Source.physical_device_name = Target.physical_device_name
+WHERE
+    Target.physical_device_name IS NULL
+ORDER BY
+    Source.backup_start_date ASC
+
+-- Declare variables for the restore command
+DECLARE @DatabaseName VARCHAR(100)
+DECLARE @PhysicalDeviceName VARCHAR(MAX)
+
+-- Declare a cursor to loop through the backup files and restore each one
+DECLARE BackupCursor CURSOR FOR
+SELECT database_name, physical_device_name
+FROM #BackupFiles
+ORDER BY backup_start_date ASC
+
+OPEN BackupCursor
+FETCH NEXT FROM BackupCursor INTO @DatabaseName, @PhysicalDeviceName
+
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    -- Construct the restore command using the current backup file and database name
+    DECLARE @RestoreCommand NVARCHAR(MAX) = ''
+        RESTORE LOG '' + QUOTENAME(@DatabaseName) + ''
+        FROM URL = '''''' + @PhysicalDeviceName + ''''''
+        WITH
+            RESTORE_OPTIONS = ''''{"s3": {"region":"us-east-1"}}'''',
+            NORECOVERY,
+            STATS = 10''
+
+    -- Execute the restore command
+EXEC sp_executesql @RestoreCommand
+--Print @RestoreCommand
+
+    FETCH NEXT FROM BackupCursor INTO @DatabaseName, @PhysicalDeviceName
+END
+
+CLOSE BackupCursor
+DEALLOCATE BackupCursor
+', 
+		@database_name=N'master', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id=@jobId, @name=N'Tog Restore Schedule', 
+		@enabled=1, 
+		@freq_type=4, 
+		@freq_interval=1, 
+		@freq_subday_type=4, 
+		@freq_subday_interval=10, 
+		@freq_relative_interval=0, 
+		@freq_recurrence_factor=0, 
+		@active_start_date=20230920, 
+		@active_end_date=99991231, 
+		@active_start_time=0, 
+		@active_end_time=235959, 
+		@schedule_uid=N'450492ae-c696-4733-bf8a-408784a3e3ab'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO

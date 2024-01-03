@@ -1,0 +1,51 @@
+;WITH MaxLastLSN AS (
+    SELECT
+        database_name,
+        MAX(last_lsn) AS max_last_lsn
+    FROM [msdb].[dbo].backupset
+    WHERE type = 'L' AND is_copy_only = 0
+    GROUP BY database_name
+)
+
+-- Insert the backup files into the temporary table
+
+SELECT
+    Source.[Database],
+    Source.physical_device_name AS [Source],
+    Source.backup_start_date AS [Backup Date],
+    Source.first_lsn,
+    Source.last_lsn
+FROM (
+    SELECT
+        BS.database_name AS [Database],
+        physical_device_name,
+        BS.first_lsn,
+        BS.last_lsn,
+        BS.backup_start_date
+    FROM
+        [ONPREM].msdb.[dbo].backupset AS BS
+        INNER JOIN [ONPREM].msdb.[dbo].backupmediaset AS BMS ON BS.media_set_id = BMS.media_set_id
+        INNER JOIN [ONPREM].msdb.[dbo].backupmediafamily AS BMF ON BMS.media_set_id = BMF.media_set_id
+        INNER JOIN MaxLastLSN AS MaxLSN ON BS.database_name = MaxLSN.database_name
+    WHERE
+        BS.type = 'L' AND
+        BS.last_lsn > MaxLSN.max_last_lsn AND
+        BS.expiration_date IS NULL
+) AS Source
+LEFT JOIN (
+    SELECT
+        bmf.physical_device_name,
+        MAX(rh.restore_date) AS restore_date
+    FROM
+        msdb.dbo.restorehistory rh
+        INNER JOIN msdb.dbo.backupset bs ON rh.backup_set_id = bs.backup_set_id
+        INNER JOIN msdb.dbo.restorefile rf ON rh.restore_history_id = rf.restore_history_id
+        INNER JOIN msdb.dbo.backupmediafamily bmf ON bmf.media_set_id = bs.media_set_id
+    WHERE
+        rh.destination_database_name IN (SELECT database_name FROM MaxLastLSN)
+    GROUP BY bmf.physical_device_name
+) AS Target ON Source.physical_device_name = Target.physical_device_name
+WHERE
+    Target.physical_device_name IS NULL
+ORDER BY
+    Source.backup_start_date ASC
